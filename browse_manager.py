@@ -59,7 +59,6 @@ class BrowseManager:
         self.all_genres: list[BrowseItem] = []
         self.all_artists: list[BrowseItem] = []
         self.all_albums: list[BrowseItem] = []
-        self.all_tracks: list[BrowseItem] = []
 
         # Current filtered view
         self.visible_artists: list[BrowseItem] = []
@@ -179,7 +178,7 @@ class BrowseManager:
 
     def _load_library_thread(self, on_complete) -> None:
         try:
-            # Not all cores expose Genres in the library root; focus on Artists/Albums/Tracks.
+            # Not all cores expose Genres in the library root; focus on Artists/Albums.
             self.all_genres = []
 
             artists, _ = self._go_library_section("Artists")
@@ -188,17 +187,12 @@ class BrowseManager:
             albums, _ = self._go_library_section("Albums")
             self.all_albums = albums
 
-            tracks, _ = self._go_library_section("Tracks")
-            self.all_tracks = tracks
-
             self.visible_artists = list(self.all_artists)
             self.visible_albums = list(self.all_albums)
-            self.visible_tracks = []
 
             logger.info(
-                "Library loaded: %d genres, %d artists, %d albums, %d tracks",
-                len(self.all_genres), len(self.all_artists),
-                len(self.all_albums), len(self.all_tracks),
+                "Library loaded: %d genres, %d artists, %d albums",
+                len(self.all_genres), len(self.all_artists), len(self.all_albums),
             )
             if on_complete:
                 on_complete(success=True)
@@ -330,7 +324,7 @@ class BrowseManager:
 
     def select_album(self, album: BrowseItem | None, on_complete: Callable | None = None) -> None:
         """
-        Load tracks for *album* using the pre-loaded Tracks library section.
+        Load tracks for *album* using Roon's browse API.
         Pass None to clear the track list.
         """
         self.selected_album = album
@@ -341,29 +335,109 @@ class BrowseManager:
                 on_complete()
             return
 
-        if not self.all_tracks:
-            logger.warning(
-                "select_album: all_tracks is empty when selecting album '%s'",
-                album.title,
+        threading.Thread(
+            target=self._load_tracks_for_album,
+            args=(album, on_complete),
+            daemon=True,
+        ).start()
+
+    def _load_tracks_for_album(self, album: BrowseItem, on_complete) -> None:
+        """
+        Resolve tracks for a single album using the same 'browse' hierarchy and
+        Library → Albums path that was used to build the Albums list. This
+        mirrors the hierarchical browse flow described in Roon's
+        RoonApiBrowse docs, but stays within the 'browse' hierarchy instead of
+        switching to a separate 'albums' hierarchy.
+        """
+        try:
+            # 1) Re-enter the Library → Albums section and get a fresh albums
+            #    list with up-to-date item_keys (Roon item_keys are not stable
+            #    across sessions).
+            albums_list, albums_level = self._go_library_section("Albums")
+            if albums_level is None:
+                logger.warning(
+                    "_load_tracks_for_album: could not re-enter Albums section for %s (%s)",
+                    album.title, album.item_key,
+                )
+                if on_complete:
+                    on_complete()
+                return
+
+            # Try to match the selected album against the fresh Albums list.
+            wanted_title = (album.title or "").lower()
+            wanted_sub = (album.subtitle or "").lower()
+
+            matched = None
+            for a in albums_list:
+                if (a.title or "").lower() == wanted_title and (a.subtitle or "").lower() == wanted_sub:
+                    matched = a
+                    break
+            if not matched:
+                # Fallback: looser match on title only.
+                for a in albums_list:
+                    if (a.title or "").lower() == wanted_title:
+                        matched = a
+                        break
+
+            if not matched:
+                logger.warning(
+                    "_load_tracks_for_album: could not match album '%s' (%s) in fresh Albums list",
+                    album.title, album.item_key,
+                )
+                if on_complete:
+                    on_complete()
+                return
+
+            # 2) Enter the specific album within that Albums list using the
+            #    refreshed item_key.
+            result = self._nav(item_key=matched.item_key)
+            if not isinstance(result, dict) or result.get("action") != "list":
+                logger.warning(
+                    "_load_tracks_for_album: album nav did not return list for %s (%s) — result=%r",
+                    album.title, matched.item_key, result,
+                )
+                if on_complete:
+                    on_complete()
+                return
+
+            level = result["list"]["level"]
+
+            # 3) Load the album contents at this level.
+            album_contents = self._load_all(level, page_size=50)
+
+            # 4) Look for a Tracks sub-list under the album.
+            tracks_node = self._find_item(album_contents, "Track")
+            if tracks_node:
+                sub_result = self._nav(item_key=tracks_node.item_key)
+                if isinstance(sub_result, dict) and sub_result.get("action") == "list":
+                    sub_level = sub_result["list"]["level"]
+                    self.visible_tracks = self._load_all(sub_level, page_size=500)
+                else:
+                    self.visible_tracks = [
+                        i for i in album_contents
+                        if i.item_key
+                        and i.hint in ("action", "action_list")
+                        and "play" not in i.title.lower()
+                        and "queue" not in i.title.lower()
+                    ]
+            else:
+                # No dedicated Tracks node; interpret album contents directly.
+                self.visible_tracks = [
+                    i for i in album_contents
+                    if i.item_key
+                    and i.hint in ("action", "action_list", "list", "")
+                    and "play" not in i.title.lower()
+                    and "queue" not in i.title.lower()
+                ]
+
+            logger.info(
+                "_load_tracks_for_album: loaded %d tracks for album '%s'",
+                len(self.visible_tracks), album.title,
             )
+
+        except Exception as e:
+            logger.error("_load_tracks_for_album error: %s", e)
+            self.visible_tracks = []
+        finally:
             if on_complete:
                 on_complete()
-            return
-
-        album_name = (album.title or "").lower()
-
-        candidates: list[BrowseItem] = []
-        for t in self.all_tracks:
-            haystack = f"{t.title} {t.subtitle}".lower()
-            if album_name and album_name in haystack:
-                candidates.append(t)
-
-        self.visible_tracks = candidates
-
-        logger.info(
-            "select_album: filtered %d tracks for album '%s'",
-            len(self.visible_tracks), album.title,
-        )
-
-        if on_complete:
-            on_complete()

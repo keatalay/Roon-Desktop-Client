@@ -19,12 +19,27 @@ class BrowseItem:
     """Lightweight container for a browse list entry."""
     __slots__ = ("title", "subtitle", "item_key", "hint", "image_key")
 
-    def __init__(self, raw: dict):
-        self.title: str = raw.get("title", "")
-        self.subtitle: str = raw.get("subtitle", "") or ""
-        self.item_key: str = raw.get("item_key", "") or ""
-        self.hint: str = raw.get("hint", "") or ""
-        self.image_key: str = raw.get("image_key", "") or ""
+    def __init__(self, raw):
+        """
+        Wrap a single Roon browse item.
+
+        Newer Roon builds sometimes return plain strings or other primitives in
+        places where we previously always saw dicts.  Be defensive here so that
+        odd items do not crash the browser.
+        """
+        if isinstance(raw, dict):
+            self.title: str = raw.get("title", "") or ""
+            self.subtitle: str = raw.get("subtitle", "") or ""
+            self.item_key: str = raw.get("item_key", "") or ""
+            self.hint: str = raw.get("hint", "") or ""
+            self.image_key: str = raw.get("image_key", "") or ""
+        else:
+            # Fallback for unexpected item shapes (e.g. plain strings)
+            self.title = str(raw)
+            self.subtitle = ""
+            self.item_key = ""
+            self.hint = ""
+            self.image_key = ""
 
     def __repr__(self):
         return f"<BrowseItem '{self.title}'>"
@@ -44,6 +59,7 @@ class BrowseManager:
         self.all_genres: list[BrowseItem] = []
         self.all_artists: list[BrowseItem] = []
         self.all_albums: list[BrowseItem] = []
+        self.all_tracks: list[BrowseItem] = []
 
         # Current filtered view
         self.visible_artists: list[BrowseItem] = []
@@ -80,8 +96,14 @@ class BrowseManager:
             )
             if not result:
                 break
-            batch = result.get("items", [])
-            items.extend(BrowseItem(r) for r in batch if r.get("item_key"))
+            batch = result.get("items", []) or []
+            for raw in batch:
+                if not isinstance(raw, dict):
+                    # Ignore unsupported shapes (e.g. plain strings)
+                    continue
+                if not raw.get("item_key"):
+                    continue
+                items.append(BrowseItem(raw))
             total = result.get("list", {}).get("count", 0)
             offset += len(batch)
             if offset >= total or not batch:
@@ -118,7 +140,7 @@ class BrowseManager:
             logger.warning("Cannot find Library node. Available: %s", root_items)
             return None
         result = self._nav(item_key=lib.item_key)
-        if result and result.get("action") == "list":
+        if isinstance(result, dict) and result.get("action") == "list":
             return result["list"]["level"]
         return None
 
@@ -136,7 +158,7 @@ class BrowseManager:
             logger.warning("Cannot find '%s'. Available: %s", section_name, lib_items)
             return [], None
         result = self._nav(item_key=section.item_key)
-        if result and result.get("action") == "list":
+        if isinstance(result, dict) and result.get("action") == "list":
             level = result["list"]["level"]
             return self._load_all(level), level
         return [], None
@@ -157,8 +179,8 @@ class BrowseManager:
 
     def _load_library_thread(self, on_complete) -> None:
         try:
-            genres, _ = self._go_library_section("Genres")
-            self.all_genres = genres
+            # Not all cores expose Genres in the library root; focus on Artists/Albums/Tracks.
+            self.all_genres = []
 
             artists, _ = self._go_library_section("Artists")
             self.all_artists = artists
@@ -166,12 +188,17 @@ class BrowseManager:
             albums, _ = self._go_library_section("Albums")
             self.all_albums = albums
 
+            tracks, _ = self._go_library_section("Tracks")
+            self.all_tracks = tracks
+
             self.visible_artists = list(self.all_artists)
             self.visible_albums = list(self.all_albums)
+            self.visible_tracks = []
 
             logger.info(
-                "Library loaded: %d genres, %d artists, %d albums",
-                len(self.all_genres), len(self.all_artists), len(self.all_albums),
+                "Library loaded: %d genres, %d artists, %d albums, %d tracks",
+                len(self.all_genres), len(self.all_artists),
+                len(self.all_albums), len(self.all_tracks),
             )
             if on_complete:
                 on_complete(success=True)
@@ -224,7 +251,7 @@ class BrowseManager:
 
             # Enter Genres
             result = self._nav(item_key=genres_item.item_key)
-            if not result or result.get("action") != "list":
+            if not isinstance(result, dict) or result.get("action") != "list":
                 self.visible_artists = list(self.all_artists)
                 if on_complete:
                     on_complete()
@@ -232,7 +259,7 @@ class BrowseManager:
 
             # Enter the specific genre
             result = self._nav(item_key=genre.item_key)
-            if not result or result.get("action") != "list":
+            if not isinstance(result, dict) or result.get("action") != "list":
                 self.visible_artists = list(self.all_artists)
                 if on_complete:
                     on_complete()
@@ -245,7 +272,7 @@ class BrowseManager:
             artists_node = self._find_item(genre_contents, "Artist")
             if artists_node:
                 result = self._nav(item_key=artists_node.item_key)
-                if result and result.get("action") == "list":
+                if isinstance(result, dict) and result.get("action") == "list":
                     level = result["list"]["level"]
                     self.visible_artists = self._load_all(level)
                 else:
@@ -270,7 +297,13 @@ class BrowseManager:
                 on_complete()
 
     def select_artist(self, artist: BrowseItem | None, on_complete: Callable | None = None) -> None:
-        """Filter the Album column by *artist*.  Pass None to reset to 'All'."""
+        """
+        Filter the Album column by *artist*.  Pass None to reset to 'All'.
+
+        Instead of relying on deep browse navigation (which can vary between
+        cores), we filter the already-loaded Albums section by matching the
+        artist's name in each album's subtitle/title.
+        """
         self.selected_artist = artist
         self.selected_album = None
         self.visible_tracks = []
@@ -281,50 +314,25 @@ class BrowseManager:
                 on_complete()
             return
 
-        threading.Thread(
-            target=self._filter_albums_by_artist,
-            args=(artist, on_complete),
-            daemon=True,
-        ).start()
+        name = (artist.title or "").lower()
+        visible: list[BrowseItem] = []
+        for alb in self.all_albums:
+            haystack = f"{alb.title} {alb.subtitle}".lower()
+            if name and name in haystack:
+                visible.append(alb)
 
-    def _filter_albums_by_artist(self, artist: BrowseItem, on_complete) -> None:
-        try:
-            self._go_root()
-            result = self._nav(item_key=artist.item_key)
-            if not result or result.get("action") != "list":
-                self.visible_albums = list(self.all_albums)
-                if on_complete:
-                    on_complete()
-                return
+        # Fallback: if we didn't match anything, keep all albums so the UI
+        # doesn't look empty; this is better than a blank column.
+        self.visible_albums = visible or list(self.all_albums)
 
-            level = result["list"]["level"]
-            artist_contents = self._load_all(level, page_size=20)
-
-            albums_node = self._find_item(artist_contents, "Album")
-            if albums_node:
-                result = self._nav(item_key=albums_node.item_key)
-                if result and result.get("action") == "list":
-                    level = result["list"]["level"]
-                    self.visible_albums = self._load_all(level)
-                else:
-                    self.visible_albums = [
-                        i for i in artist_contents
-                        if i.hint in ("list", "action_list")
-                    ]
-            else:
-                self.visible_albums = [
-                    i for i in artist_contents if i.hint in ("list", "action_list")
-                ]
-
-        except Exception as e:
-            logger.error("_filter_albums_by_artist error: %s", e)
-            self.visible_albums = list(self.all_albums)
-        finally:
-            if on_complete:
-                on_complete()
+        if on_complete:
+            on_complete()
 
     def select_album(self, album: BrowseItem | None, on_complete: Callable | None = None) -> None:
-        """Load tracks for *album*.  Pass None to clear track list."""
+        """
+        Load tracks for *album* using the pre-loaded Tracks library section.
+        Pass None to clear the track list.
+        """
         self.selected_album = album
         self.visible_tracks = []
 
@@ -333,47 +341,29 @@ class BrowseManager:
                 on_complete()
             return
 
-        threading.Thread(
-            target=self._load_tracks_for_album,
-            args=(album, on_complete),
-            daemon=True,
-        ).start()
-
-    def _load_tracks_for_album(self, album: BrowseItem, on_complete) -> None:
-        try:
-            self._go_root()
-            result = self._nav(item_key=album.item_key)
-            if not result or result.get("action") != "list":
-                if on_complete:
-                    on_complete()
-                return
-
-            level = result["list"]["level"]
-            album_contents = self._load_all(level, page_size=20)
-
-            tracks_node = self._find_item(album_contents, "Track")
-            if tracks_node:
-                result = self._nav(item_key=tracks_node.item_key)
-                if result and result.get("action") == "list":
-                    level = result["list"]["level"]
-                    self.visible_tracks = self._load_all(level, page_size=200)
-                else:
-                    self.visible_tracks = [
-                        i for i in album_contents
-                        if i.hint == "action" and "play" not in i.title.lower()
-                    ]
-            else:
-                # Direct track listing (most common)
-                self.visible_tracks = [
-                    i for i in album_contents
-                    if i.hint in ("action", "action_list")
-                    and "play" not in i.title.lower()
-                    and "queue" not in i.title.lower()
-                ]
-
-        except Exception as e:
-            logger.error("_load_tracks_for_album error: %s", e)
-            self.visible_tracks = []
-        finally:
+        if not self.all_tracks:
+            logger.warning(
+                "select_album: all_tracks is empty when selecting album '%s'",
+                album.title,
+            )
             if on_complete:
                 on_complete()
+            return
+
+        album_name = (album.title or "").lower()
+
+        candidates: list[BrowseItem] = []
+        for t in self.all_tracks:
+            haystack = f"{t.title} {t.subtitle}".lower()
+            if album_name and album_name in haystack:
+                candidates.append(t)
+
+        self.visible_tracks = candidates
+
+        logger.info(
+            "select_album: filtered %d tracks for album '%s'",
+            len(self.visible_tracks), album.title,
+        )
+
+        if on_complete:
+            on_complete()

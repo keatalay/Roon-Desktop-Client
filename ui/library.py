@@ -158,16 +158,15 @@ class LibraryBrowser(QWidget):
         bh.setContentsMargins(0, 0, 0, 0)
         bh.setSpacing(0)
 
-        self._genre_col  = ColumnList("Genres")
+        # Narrowed to Artists / Albums only
         self._artist_col = ColumnList("Artists")
         self._album_col  = ColumnList("Albums")
 
-        self._genre_col.set_on_select(self._on_genre_select)
         self._artist_col.set_on_select(self._on_artist_select)
         self._album_col.set_on_select(self._on_album_select)
 
         for col, is_last in [
-            (self._genre_col, False), (self._artist_col, False), (self._album_col, True)
+            (self._artist_col, False), (self._album_col, True)
         ]:
             bh.addWidget(col, stretch=1)
             if not is_last:
@@ -208,7 +207,6 @@ class LibraryBrowser(QWidget):
     def refresh_all(self):
         if not self._browse:
             return
-        self._genre_col.populate(self._browse.all_genres, "Genres")
         self._artist_col.populate(self._browse.all_artists, "Artists")
         self._album_col.populate(self._browse.all_albums, "Albums")
         self._track_list.populate([])

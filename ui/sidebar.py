@@ -50,14 +50,9 @@ class Sidebar(QListWidget):
         return item
 
     def _build_static(self):
+        # Keep a simple Library header with no per-type tabs; the main library
+        # browser handles Artists/Albums filtering directly.
         self._add_section("Library")
-        for label, key in [
-            ("Genres",  "genres"),
-            ("Artists", "artists"),
-            ("Albums",  "albums"),
-            ("Songs",   "songs"),
-        ]:
-            self._add_item(label, key)
 
         self._playlists_section_row = None   # populated later
         self._zones_section_row = None

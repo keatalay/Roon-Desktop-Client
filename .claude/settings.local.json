@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import tkinter; print\\(''tkinter OK''\\)\")",
+      "Bash(pip3 show:*)",
+      "Bash(pip3 install:*)",
+      "Bash(/usr/bin/python3 -c \"import tkinter; print\\(''tkinter OK, version:'', tkinter.TkVersion\\)\")",
+      "Bash(/usr/bin/python3 --version)",
+      "Bash(for f:*)",
+      "Bash(do)",
+      "Bash(sed -i '' '1s/^/from __future__ import annotations\\\\n/' \"$f\")",
+      "Bash(echo \"patched $f\")",
+      "Bash(done)"
+    ]
+  }
+}
